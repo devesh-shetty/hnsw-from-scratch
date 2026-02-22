@@ -6,8 +6,10 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"hnsw-from-scratch/datasets"
@@ -40,6 +42,7 @@ func main() {
 	glovePath := flag.String("glove", "", "path to GloVe file")
 	limit := flag.Int("limit", 0, "limit number of vectors (0 = all)")
 	queries := flag.Int("queries", 200, "number of query vectors")
+	holdout := flag.Int("holdout", 0, "hold out N vectors for queries (glove/sweep/msweep)")
 	k := flag.Int("k", 10, "top-k")
 	m := flag.Int("m", 16, "HNSW M")
 	efC := flag.Int("efc", 100, "efConstruction")
@@ -59,11 +62,11 @@ func main() {
 	case "benchmark":
 		runBenchmark(*seed)
 	case "glove":
-		runGloVe(*seed, *glovePath, *limit, *queries, *k, *m, *efC, *ef, *metric, *compare, *flat, *demoWord)
+		runGloVe(*seed, *glovePath, *limit, *queries, *holdout, *k, *m, *efC, *ef, *metric, *compare, *flat, *demoWord)
 	case "sweep":
-		runSweep(*seed, *glovePath, *limit, *queries, *k, *m, *efC, *efList, *metric)
+		runSweep(*seed, *glovePath, *limit, *queries, *holdout, *k, *m, *efC, *efList, *metric)
 	case "msweep":
-		runMSweep(*seed, *glovePath, *limit, *queries, *k, *mList, *efC, *ef, *metric)
+		runMSweep(*seed, *glovePath, *limit, *queries, *holdout, *k, *mList, *efC, *ef, *metric)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode: %s\n", *mode)
 		os.Exit(1)
@@ -128,23 +131,36 @@ func runBenchmark(seed int64) {
 	fmt.Printf("Latency p50=%dus p95=%dus\n", res.p50us, res.p95us)
 }
 
-func runGloVe(seed int64, path string, limit, queries, k, m, efC, ef int, metric string, compare, flat bool, demoWord string) {
+func runGloVe(seed int64, path string, limit, queries, holdout, k, m, efC, ef int, metric string, compare, flat bool, demoWord string) {
 	if path == "" {
 		fmt.Fprintln(os.Stderr, "missing -glove path")
 		os.Exit(1)
 	}
 
 	data, distance := loadGloVe(path, limit, metric)
+	splitRng := rand.New(rand.NewSource(seed + 2))
+	indexWords, indexVectors, holdoutWords, holdoutVectors := splitHoldout(data.words, data.vectors, holdout, splitRng)
+
 	queryRng := rand.New(rand.NewSource(seed + 1))
-	sampledQueries := sampleQueriesVectors(data.vectors, queries, queryRng)
+	useIndex := holdout == 0
+	querySource := indexVectors
+	if holdout > 0 {
+		querySource = holdoutVectors
+	}
+	sampledQueries := sampleQueriesVectors(querySource, queries, queryRng, useIndex)
 
-	ground, bruteRes := bruteForceEval(sampledQueries, data.vectors, k, distance)
+	ground, bruteRes := bruteForceEval(sampledQueries, indexVectors, k, distance)
 
-	g, buildTime := buildGraph(data.vectors, m, efC, distance, seed, flat)
+	g, buildTime := buildGraph(indexVectors, m, efC, distance, seed, flat)
 	res := eval(g, sampledQueries, ground, k, ef)
 
-	fmt.Printf("Build: n=%d dim=%d time=%s\n", len(data.vectors), data.dim, buildTime)
-	fmt.Printf("GloVe: n=%d dim=%d metric=%s M=%d efConstruction=%d flat=%v\n", len(data.vectors), data.dim, metric, m, efC, flat)
+	fmt.Printf("Build: n=%d dim=%d time=%s\n", len(indexVectors), data.dim, buildTime)
+	if holdout > 0 {
+		fmt.Printf("GloVe: n=%d dim=%d metric=%s M=%d efConstruction=%d flat=%v holdout=%d\n", len(indexVectors), data.dim, metric, m, efC, flat, holdout)
+	} else {
+		fmt.Printf("GloVe: n=%d dim=%d metric=%s M=%d efConstruction=%d flat=%v\n", len(indexVectors), data.dim, metric, m, efC, flat)
+	}
+	printMem("Memory (post-build)")
 	fmt.Printf("Brute-force: QPS=%.1f p50=%dus p95=%dus\n", bruteRes.qps, bruteRes.p50us, bruteRes.p95us)
 	fmt.Printf("Search: queries=%d k=%d efSearch=%d\n", queries, k, ef)
 	fmt.Printf("Recall@%d: %.3f\n", k, res.recall)
@@ -152,7 +168,7 @@ func runGloVe(seed int64, path string, limit, queries, k, m, efC, ef int, metric
 	fmt.Printf("Latency p50=%dus p95=%dus\n", res.p50us, res.p95us)
 
 	if compare {
-		flatGraph, flatBuild := buildGraph(data.vectors, m, efC, distance, seed+1, true)
+		flatGraph, flatBuild := buildGraph(indexVectors, m, efC, distance, seed+1, true)
 		flatRes := eval(flatGraph, sampledQueries, ground, k, ef)
 		fmt.Printf("\nCompare (flat vs HNSW)\n")
 		fmt.Printf("Flat build time: %s\n", flatBuild)
@@ -161,31 +177,44 @@ func runGloVe(seed int64, path string, limit, queries, k, m, efC, ef int, metric
 	}
 
 	if demoWord != "" {
-		idx := wordIndex(data.words, demoWord)
+		idx := wordIndex(indexWords, demoWord)
 		if idx == -1 {
+			if holdout > 0 {
+				if wordIndex(holdoutWords, demoWord) != -1 {
+					fmt.Printf("\nDemo word %q was held out of the index\n", demoWord)
+					return
+				}
+			}
 			fmt.Printf("\nDemo word %q not found in GloVe subset\n", demoWord)
 			return
 		}
-		neighbors := g.SearchK(data.vectors[idx], k, ef)
+		neighbors := g.SearchK(indexVectors[idx], k, ef)
 		fmt.Printf("\nNearest neighbors for %q:\n", demoWord)
 		for _, n := range neighbors {
-			fmt.Printf("  %s (dist=%.4f)\n", data.words[n.ID], n.Dist)
+			fmt.Printf("  %s (dist=%.4f)\n", indexWords[n.ID], n.Dist)
 		}
 	}
 }
 
-func runSweep(seed int64, path string, limit, queries, k, m, efC int, efList, metric string) {
+func runSweep(seed int64, path string, limit, queries, holdout, k, m, efC int, efList, metric string) {
 	if path == "" {
 		fmt.Fprintln(os.Stderr, "missing -glove path")
 		os.Exit(1)
 	}
 
 	data, distance := loadGloVe(path, limit, metric)
+	splitRng := rand.New(rand.NewSource(seed + 2))
+	_, indexVectors, _, holdoutVectors := splitHoldout(data.words, data.vectors, holdout, splitRng)
 	queryRng := rand.New(rand.NewSource(seed + 1))
-	sampledQueries := sampleQueriesVectors(data.vectors, queries, queryRng)
-	ground, _ := bruteForceEval(sampledQueries, data.vectors, k, distance)
+	useIndex := holdout == 0
+	querySource := indexVectors
+	if holdout > 0 {
+		querySource = holdoutVectors
+	}
+	sampledQueries := sampleQueriesVectors(querySource, queries, queryRng, useIndex)
+	ground, _ := bruteForceEval(sampledQueries, indexVectors, k, distance)
 
-	g, buildTime := buildGraph(data.vectors, m, efC, distance, seed, false)
+	g, buildTime := buildGraph(indexVectors, m, efC, distance, seed, false)
 
 	values := parseIntList(efList)
 	if len(values) == 0 {
@@ -193,8 +222,13 @@ func runSweep(seed int64, path string, limit, queries, k, m, efC int, efList, me
 		os.Exit(1)
 	}
 
-	fmt.Printf("Build: n=%d dim=%d time=%s\n", len(data.vectors), data.dim, buildTime)
-	fmt.Printf("Sweep: n=%d dim=%d metric=%s M=%d efConstruction=%d\n", len(data.vectors), data.dim, metric, m, efC)
+	fmt.Printf("Build: n=%d dim=%d time=%s\n", len(indexVectors), data.dim, buildTime)
+	if holdout > 0 {
+		fmt.Printf("Sweep: n=%d dim=%d metric=%s M=%d efConstruction=%d holdout=%d\n", len(indexVectors), data.dim, metric, m, efC, holdout)
+	} else {
+		fmt.Printf("Sweep: n=%d dim=%d metric=%s M=%d efConstruction=%d\n", len(indexVectors), data.dim, metric, m, efC)
+	}
+	printMem("Memory (post-build)")
 	fmt.Printf("efSearch\trecall@%d\tqps\tp50us\tp95us\n", k)
 	for _, ef := range values {
 		res := eval(g, sampledQueries, ground, k, ef)
@@ -202,16 +236,23 @@ func runSweep(seed int64, path string, limit, queries, k, m, efC int, efList, me
 	}
 }
 
-func runMSweep(seed int64, path string, limit, queries, k int, mList string, efC, ef int, metric string) {
+func runMSweep(seed int64, path string, limit, queries, holdout, k int, mList string, efC, ef int, metric string) {
 	if path == "" {
 		fmt.Fprintln(os.Stderr, "missing -glove path")
 		os.Exit(1)
 	}
 
 	data, distance := loadGloVe(path, limit, metric)
+	splitRng := rand.New(rand.NewSource(seed + 2))
+	_, indexVectors, _, holdoutVectors := splitHoldout(data.words, data.vectors, holdout, splitRng)
 	queryRng := rand.New(rand.NewSource(seed + 1))
-	sampledQueries := sampleQueriesVectors(data.vectors, queries, queryRng)
-	ground, _ := bruteForceEval(sampledQueries, data.vectors, k, distance)
+	useIndex := holdout == 0
+	querySource := indexVectors
+	if holdout > 0 {
+		querySource = holdoutVectors
+	}
+	sampledQueries := sampleQueriesVectors(querySource, queries, queryRng, useIndex)
+	ground, _ := bruteForceEval(sampledQueries, indexVectors, k, distance)
 
 	values := parseIntList(mList)
 	if len(values) == 0 {
@@ -219,10 +260,14 @@ func runMSweep(seed int64, path string, limit, queries, k int, mList string, efC
 		os.Exit(1)
 	}
 
-	fmt.Printf("MSweep: n=%d dim=%d metric=%s efConstruction=%d efSearch=%d\n", len(data.vectors), data.dim, metric, efC, ef)
+	if holdout > 0 {
+		fmt.Printf("MSweep: n=%d dim=%d metric=%s efConstruction=%d efSearch=%d holdout=%d\n", len(indexVectors), data.dim, metric, efC, ef, holdout)
+	} else {
+		fmt.Printf("MSweep: n=%d dim=%d metric=%s efConstruction=%d efSearch=%d\n", len(indexVectors), data.dim, metric, efC, ef)
+	}
 	fmt.Printf("M\trecall@%d\tqps\tp50us\tp95us\n", k)
 	for i, mv := range values {
-		g, buildTime := buildGraph(data.vectors, mv, efC, distance, seed+int64(i), false)
+		g, buildTime := buildGraph(indexVectors, mv, efC, distance, seed+int64(i), false)
 		res := eval(g, sampledQueries, ground, k, ef)
 		fmt.Printf("%d\t%.3f\t%.1f\t%d\t%d\t(build %s)\n", mv, res.recall, res.qps, res.p50us, res.p95us, buildTime)
 	}
@@ -268,19 +313,84 @@ func pickDistance(metric string) hnsw.DistanceFunc {
 
 type indexedQuery struct {
 	vector []float32
-	index  int // position in the original dataset
+	index  int // position in the index dataset, or -1 if held out
 }
 
-func sampleQueriesVectors(vectors [][]float32, queries int, rng *rand.Rand) []indexedQuery {
+func sampleQueriesVectors(vectors [][]float32, queries int, rng *rand.Rand, useIndex bool) []indexedQuery {
 	if queries > len(vectors) {
 		queries = len(vectors)
 	}
 	out := make([]indexedQuery, 0, queries)
 	perm := rng.Perm(len(vectors))
 	for i := 0; i < queries; i++ {
-		out = append(out, indexedQuery{vector: vectors[perm[i]], index: perm[i]})
+		idx := -1
+		if useIndex {
+			idx = perm[i]
+		}
+		out = append(out, indexedQuery{vector: vectors[perm[i]], index: idx})
 	}
 	return out
+}
+
+func splitHoldout(words []string, vectors [][]float32, holdout int, rng *rand.Rand) ([]string, [][]float32, []string, [][]float32) {
+	n := len(vectors)
+	if holdout <= 0 || holdout >= n {
+		return words, vectors, nil, nil
+	}
+
+	perm := rng.Perm(n)
+	indexWords := make([]string, 0, n-holdout)
+	indexVectors := make([][]float32, 0, n-holdout)
+	holdoutWords := make([]string, 0, holdout)
+	holdoutVectors := make([][]float32, 0, holdout)
+
+	for i, idx := range perm {
+		if i < holdout {
+			holdoutWords = append(holdoutWords, words[idx])
+			holdoutVectors = append(holdoutVectors, vectors[idx])
+		} else {
+			indexWords = append(indexWords, words[idx])
+			indexVectors = append(indexVectors, vectors[idx])
+		}
+	}
+
+	return indexWords, indexVectors, holdoutWords, holdoutVectors
+}
+
+func printMem(label string) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	rss, ok := readRSSBytes()
+	if ok {
+		fmt.Printf("%s: heapAlloc=%s heapSys=%s sys=%s rss=%s\n", label, formatBytes(m.HeapAlloc), formatBytes(m.HeapSys), formatBytes(m.Sys), formatBytes(rss))
+		return
+	}
+	fmt.Printf("%s: heapAlloc=%s heapSys=%s sys=%s\n", label, formatBytes(m.HeapAlloc), formatBytes(m.HeapSys), formatBytes(m.Sys))
+}
+
+func readRSSBytes() (uint64, bool) {
+	var rusage syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &rusage); err != nil {
+		return 0, false
+	}
+	rss := uint64(rusage.Maxrss)
+	if runtime.GOOS == "linux" {
+		rss *= 1024
+	}
+	return rss, true
+}
+
+func formatBytes(b uint64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%dB", b)
+	}
+	div, exp := uint64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 func eval(g *hnsw.Graph, queries []indexedQuery, ground [][]hnsw.Neighbor, k int, efSearch int) evalResult {

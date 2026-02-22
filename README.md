@@ -129,6 +129,7 @@ go run ./cmd/hnsw-demo \
 | `-glove` | | Path to a GloVe text file |
 | `-limit` | `0` (all) | Max vectors to load |
 | `-queries` | `200` | Number of query vectors |
+| `-holdout` | `0` | Hold out N vectors for the query set (glove/sweep/msweep) |
 | `-k` | `10` | Top-k neighbors |
 | `-m` | `16` | HNSW M parameter (max connections per layer) |
 | `-efc` | `100` | efConstruction (build-time search depth) |
@@ -143,8 +144,10 @@ go run ./cmd/hnsw-demo \
 ## Notes
 
 - Queries are sampled from the indexed set. Self-matches are excluded from recall scoring.
+- Use `-holdout` to split the dataset into index and query sets. Queries are drawn from the held-out set.
 - `-metric cosine` normalizes all vectors before indexing.
 - Brute-force ground truth is computed over the loaded subset. Large `-limit` values make this slow.
+- GloVe runs print a post-build memory snapshot (heapAlloc, heapSys, sys, and RSS when available).
 - Defaults are intentionally small to keep runs fast. Use `-limit 20000` for quick iteration, the full 1.2M GloVe set for publication-quality numbers.
 
 ## References
